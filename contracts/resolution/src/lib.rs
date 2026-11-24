@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, Env, IntoVal,
-    Symbol,
+    Map, Symbol, Vec,
 };
 
 pub mod errors;
@@ -54,8 +54,121 @@ fn call_markets_version(env: &Env, address: &Address) -> Result<u32, ContractErr
 // Contract
 // ---------------------------------------------------------------------------
 
+use errors::ContractError;
+
+const COOLDOWN_TTL_LEDGERS: u32 = 535_680;
+const RESOLUTION_TTL_LEDGERS: u32 = 6_307_200;
+
+#[contracttype]
+#[derive(Clone)]
+enum DataKey {
+    Admin,
+    MarketsContract,
+    OracleContract,
+    ResolutionCooldownSeconds,
+    LastResolution(Address),
+    ResolutionStatus(u32),
+}
+
+/// Status returned by resolution queries and successful resolutions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionStatus {
+    pub market_id: u32,
+    pub winning_outcomes: Vec<u32>,
+    pub resolved_at: u64,
+    pub oracle: Address,
+}
+
 #[contract]
 pub struct ResolutionContract;
+
+impl ResolutionContract {
+    /// Checks both TTL constants against the network's `max_ttl` at initialize time.
+    ///
+    /// When a constant exceeds `max_ttl` the Soroban host would silently clamp the
+    /// actual TTL, causing earlier-than-expected expiry without any observable signal.
+    /// This helper makes the mismatch explicit: it returns
+    /// `Err(ContractError::TtlExceedsNetworkMax)` so callers can decide whether to
+    /// abort initialization or accept the clamped values.  An event is also emitted so
+    /// off-chain monitors can detect the condition in historical ledger data.
+    ///
+    /// The event schema is:
+    ///   topics:  [`"ttl_warn"`, `"<constant_name>"`]
+    ///   data:    `(desired: u32, effective: u32)`
+    fn validate_ttl_config(env: &Env) -> Result<(), ContractError> {
+        let max = env.storage().max_ttl();
+        let mut exceeded = false;
+
+        if COOLDOWN_TTL_LEDGERS > max {
+            let effective = max;
+            env.events().publish(
+                (symbol_short!("ttl_warn"), Symbol::new(env, "cooldown_ttl")),
+                (COOLDOWN_TTL_LEDGERS, effective),
+            );
+            exceeded = true;
+        }
+
+        if RESOLUTION_TTL_LEDGERS > max {
+            let effective = max;
+            env.events().publish(
+                (symbol_short!("ttl_warn"), Symbol::new(env, "resolution_ttl")),
+                (RESOLUTION_TTL_LEDGERS, effective),
+            );
+            exceeded = true;
+        }
+
+        if exceeded {
+            return Err(ContractError::TtlExceedsNetworkMax);
+        }
+
+        Ok(())
+    }
+
+    fn extend_ttl(env: &Env, key: &DataKey, desired_ttl: u32) {
+        let ttl = desired_ttl.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, ttl, ttl);
+    }
+
+    fn require_admin(env: &Env, admin: &Address) {
+        admin.require_auth();
+        if env.storage().persistent().has(&DataKey::Admin) {
+            Self::extend_ttl(env, &DataKey::Admin, COOLDOWN_TTL_LEDGERS);
+        }
+        let configured_admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        if configured_admin.as_ref() != Some(admin) {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+    }
+
+    fn check_cooldown(env: &Env, resolver: &Address) -> Result<(), ContractError> {
+        let cooldown: u64 = if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ResolutionCooldownSeconds)
+        {
+            Self::extend_ttl(
+                env,
+                &DataKey::ResolutionCooldownSeconds,
+                COOLDOWN_TTL_LEDGERS,
+            );
+            env.storage()
+                .persistent()
+                .get(&DataKey::ResolutionCooldownSeconds)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let key = DataKey::LastResolution(resolver.clone());
+        if let Some(last_resolution) = env.storage().persistent().get::<_, u64>(&key) {
+            Self::extend_ttl(env, &key, COOLDOWN_TTL_LEDGERS);
+            if cooldown > 0 && env.ledger().timestamp() < last_resolution.saturating_add(cooldown) {
+                return Err(ContractError::ResolutionCooldownActive);
+            }
+        }
+        Ok(())
+    }
+}
 
 #[contractimpl]
 impl ResolutionContract {
