@@ -14,8 +14,8 @@ fn test_error_discriminant_stability() {
     assert_eq!(ContractError::ResolutionCooldownActive as u32, 9);
     assert_eq!(ContractError::OracleResultNotAvailable as u32, 10);
     assert_eq!(ContractError::InvalidWinningOutcomes as u32, 11);
-    assert_eq!(ContractError::OracleNotRegistered as u32, 12);
-    assert_eq!(ContractError::TtlExceedsNetworkMax as u32, 13);
+    assert_eq!(ContractError::MarketsContractInvalid as u32, 12);
+    assert_eq!(ContractError::MarketsVersionMismatch as u32, 13);
 }
 
 #[test]
@@ -39,7 +39,8 @@ fn test_error_ordering() {
     assert!(ContractError::Overflow < ContractError::ResolutionCooldownActive);
     assert!(ContractError::ResolutionCooldownActive < ContractError::OracleResultNotAvailable);
     assert!(ContractError::OracleResultNotAvailable < ContractError::InvalidWinningOutcomes);
-    assert!(ContractError::InvalidWinningOutcomes < ContractError::OracleNotRegistered);
+    assert!(ContractError::InvalidWinningOutcomes < ContractError::MarketsContractInvalid);
+    assert!(ContractError::MarketsContractInvalid < ContractError::MarketsVersionMismatch);
 }
 
 #[test]
@@ -81,8 +82,8 @@ fn test_all_error_variants_distinct() {
         ContractError::ResolutionCooldownActive,
         ContractError::OracleResultNotAvailable,
         ContractError::InvalidWinningOutcomes,
-        ContractError::OracleNotRegistered,
-        ContractError::TtlExceedsNetworkMax,
+        ContractError::MarketsContractInvalid,
+        ContractError::MarketsVersionMismatch,
     ];
     
     let discriminants: Vec<u32> = errors.iter().map(|e| *e as u32).collect();

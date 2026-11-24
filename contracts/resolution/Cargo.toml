@@ -21,9 +21,5 @@ name = "error_tests"
 path = "tests/error_tests.rs"
 
 [[test]]
-name = "resolution_flow"
-path = "tests/resolution_flow.rs"
-
-[[test]]
-name = "gas_snap"
-path = "tests/gas_snap.rs"
+name = "init_validation_tests"
+path = "tests/init_validation_tests.rs"

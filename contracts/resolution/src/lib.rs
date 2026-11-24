@@ -6,6 +6,53 @@ use soroban_sdk::{
 };
 
 pub mod errors;
+pub use errors::ContractError;
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+
+/// Persistent-storage keys used by the Resolution contract.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// Whether the contract has been initialized.
+    Initialized,
+    /// The admin address set at initialization.
+    Admin,
+    /// The address of the trusted MarketsContract.
+    MarketsContract,
+    /// The `version()` value returned by the MarketsContract at initialization.
+    /// Every resolution call re-validates the live version against this value.
+    ExpectedMarketsVersion,
+}
+
+// ---------------------------------------------------------------------------
+// Cross-contract helper
+// ---------------------------------------------------------------------------
+
+/// Call `version()` on the contract at `address` and return the result.
+///
+/// Returns `Err(ContractError::MarketsContractInvalid)` if the call panics or
+/// the returned value cannot be decoded as `u32`.
+fn call_markets_version(env: &Env, address: &Address) -> Result<u32, ContractError> {
+    let result = env.try_invoke_contract::<u32, ContractError>(
+        address,
+        &symbol_short!("version"),
+        soroban_sdk::vec![env],
+    );
+
+    match result {
+        Ok(Ok(v)) => Ok(v),
+        // Any error — host panic, wrong type, or contract error — is treated
+        // as a misconfigured address.
+        _ => Err(ContractError::MarketsContractInvalid),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract
+// ---------------------------------------------------------------------------
 
 use errors::ContractError;
 
@@ -125,334 +172,171 @@ impl ResolutionContract {
 
 #[contractimpl]
 impl ResolutionContract {
-    /// Returns the contract version for the resolution subsystem.
+    // -----------------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------------
+
+    /// Initialize the Resolution contract.
+    ///
+    /// Calls `version()` on `markets_contract` to verify it is a reachable,
+    /// well-formed MarketsContract. The returned version is stored and
+    /// re-validated on every future resolution call.
+    ///
+    /// # Parameters
+    ///
+    /// * `admin`            — Address that owns this contract. Must sign the
+    ///                        transaction (`require_auth` enforced).
+    /// * `markets_contract` — Address of the MarketsContract to validate and
+    ///                        store. Must expose a `version() -> u32` entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// * [`ContractError::InvalidState`]           — Already initialized.
+    /// * [`ContractError::MarketsContractInvalid`] — Cross-contract `version()` call
+    ///   failed; the address is not a valid MarketsContract.
+    ///
+    /// # Auth
+    ///
+    /// Requires a valid signature from `admin`.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        markets_contract: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::Initialized) {
+            return Err(ContractError::InvalidState);
+        }
+
+        // Validate the markets contract by calling its version() entrypoint.
+        let markets_version = call_markets_version(&env, &markets_contract)?;
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::MarketsContract, &markets_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::ExpectedMarketsVersion, &markets_version);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolution
+    // -----------------------------------------------------------------------
+
+    /// Resolve a market by updating its state in the MarketsContract.
+    ///
+    /// Before performing any cross-contract state update, this function
+    /// re-validates the stored MarketsContract address by calling its
+    /// `version()` entrypoint. The live version must match the value recorded
+    /// at initialization, ensuring no contract substitution has occurred since
+    /// deployment.
+    ///
+    /// # Parameters
+    ///
+    /// * `admin`      — Must be the stored admin. Must sign the call.
+    /// * `market_id`  — Identifier of the market to resolve.
+    /// * `outcome`    — The winning outcome to record.
+    ///
+    /// # Errors
+    ///
+    /// * [`ContractError::InvalidState`]           — Not yet initialized.
+    /// * [`ContractError::Unauthorized`]           — Caller is not the stored admin.
+    /// * [`ContractError::MarketsContractInvalid`] — Re-validation `version()` call
+    ///   failed; the stored address is no longer reachable.
+    /// * [`ContractError::MarketsVersionMismatch`] — Live version differs from the
+    ///   version recorded at initialization.
+    ///
+    /// # Auth
+    ///
+    /// Requires a valid signature from `admin`.
+    pub fn resolve(
+        env: Env,
+        admin: Address,
+        market_id: Symbol,
+        outcome: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        Self::assert_initialized(&env)?;
+        Self::assert_is_admin(&env, &admin)?;
+
+        let markets_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketsContract)
+            .ok_or(ContractError::InvalidState)?;
+
+        let expected_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExpectedMarketsVersion)
+            .ok_or(ContractError::InvalidState)?;
+
+        // Re-validate the markets contract on every resolution call.
+        let live_version = call_markets_version(&env, &markets_contract)?;
+        if live_version != expected_version {
+            return Err(ContractError::MarketsVersionMismatch);
+        }
+
+        // Cross-contract call: update market state.
+        env.invoke_contract::<()>(
+            &markets_contract,
+            &symbol_short!("resolve"),
+            soroban_sdk::vec![&env, market_id.into_val(&env), outcome.into_val(&env)],
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-only
+    // -----------------------------------------------------------------------
+
+    /// Return the contract version for the resolution subsystem.
+    ///
+    /// This read-only introspection entrypoint does not require authentication.
     pub fn version(_env: Env) -> u32 {
         7
     }
 
-    /// Initialize the administrator that configures market and oracle contracts.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
-        admin.require_auth();
-        if env.storage().persistent().has(&DataKey::Admin) {
+    /// Return the stored MarketsContract address, or `None` before initialization.
+    pub fn markets_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::MarketsContract)
+    }
+
+    /// Return the MarketsContract version recorded at initialization, or `None`
+    /// before initialization.
+    pub fn expected_markets_version(env: Env) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExpectedMarketsVersion)
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    fn assert_initialized(env: &Env) -> Result<(), ContractError> {
+        if !env.storage().instance().has(&DataKey::Initialized) {
             return Err(ContractError::InvalidState);
         }
-        Self::validate_ttl_config(&env)?;
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        Self::extend_ttl(&env, &DataKey::Admin, COOLDOWN_TTL_LEDGERS);
         Ok(())
     }
 
-    /// Configure the contracts used to read markets and oracle results.
-    pub fn set_integrations(
-        env: Env,
-        admin: Address,
-        markets_contract: Address,
-        oracle_contract: Address,
-    ) -> Result<(), ContractError> {
-        Self::require_admin(&env, &admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::MarketsContract, &markets_contract);
-        env.storage()
-            .persistent()
-            .set(&DataKey::OracleContract, &oracle_contract);
-        Self::extend_ttl(&env, &DataKey::MarketsContract, COOLDOWN_TTL_LEDGERS);
-        Self::extend_ttl(&env, &DataKey::OracleContract, COOLDOWN_TTL_LEDGERS);
+    fn assert_is_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::Unauthorized)?;
+        if stored != *caller {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
         Ok(())
-    }
-
-    /// Set the minimum time between successful resolutions by the same resolver.
-    pub fn set_resolution_cooldown(
-        env: Env,
-        admin: Address,
-        seconds: u64,
-    ) -> Result<(), ContractError> {
-        Self::require_admin(&env, &admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ResolutionCooldownSeconds, &seconds);
-        Self::extend_ttl(
-            &env,
-            &DataKey::ResolutionCooldownSeconds,
-            COOLDOWN_TTL_LEDGERS,
-        );
-        Ok(())
-    }
-
-    /// Resolve a market from the configured oracle's result.
-    ///
-    /// The oracle must expose `get_result(market_id) -> Option<Vec<u32>>`.
-    /// The market contract must expose `get_market_for_resolution(market_id)`
-    /// and `resolve_market_with_outcomes(resolver, market_id, outcomes)`.
-    pub fn resolve_market(
-        env: Env,
-        resolver: Address,
-        market_id: u32,
-    ) -> Result<ResolutionStatus, ContractError> {
-        resolver.require_auth();
-        if env.storage().persistent().has(&DataKey::Admin) {
-            Self::extend_ttl(&env, &DataKey::Admin, COOLDOWN_TTL_LEDGERS);
-        }
-
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::ResolutionStatus(market_id))
-        {
-            return Err(ContractError::MarketAlreadyResolved);
-        }
-        let markets_contract: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MarketsContract)
-            .ok_or(ContractError::InvalidState)?;
-        Self::extend_ttl(&env, &DataKey::MarketsContract, COOLDOWN_TTL_LEDGERS);
-        let oracle_contract: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OracleContract)
-            .ok_or(ContractError::InvalidState)?;
-        Self::extend_ttl(&env, &DataKey::OracleContract, COOLDOWN_TTL_LEDGERS);
-
-        let market = match env
-            .try_invoke_contract::<Option<(Address, u64, u32, bool, bool)>, soroban_sdk::Error>(
-                &markets_contract,
-                &Symbol::new(&env, "get_market_for_resolution"),
-                soroban_sdk::vec![&env, market_id.into()],
-            ) {
-            Ok(Ok(Some(market))) => market,
-            Ok(Ok(None)) => return Err(ContractError::MarketNotFound),
-            _ => return Err(ContractError::InvalidState),
-        };
-        let (market_creator, market_end_time, outcome_count, resolved, cancelled) = market;
-        if resolver != market_creator {
-            return Err(ContractError::Unauthorized);
-        }
-        if resolved {
-            return Err(ContractError::MarketAlreadyResolved);
-        }
-        if cancelled {
-            return Err(ContractError::InvalidState);
-        }
-        if env.ledger().timestamp() < market_end_time {
-            return Err(ContractError::MarketClosed);
-        }
-        Self::check_cooldown(&env, &resolver)?;
-
-        let winning_outcomes = match env
-            .try_invoke_contract::<Option<Vec<u32>>, soroban_sdk::Error>(
-                &oracle_contract,
-                &Symbol::new(&env, "get_result"),
-                soroban_sdk::vec![&env, market_id.into()],
-            ) {
-            Ok(Ok(Some(result))) => result,
-            _ => return Err(ContractError::OracleResultNotAvailable),
-        };
-        if winning_outcomes.is_empty() {
-            return Err(ContractError::InvalidWinningOutcomes);
-        }
-
-        if winning_outcomes.len() > outcome_count {
-            return Err(ContractError::InvalidWinningOutcomes);
-        }
-        let mut seen = Map::<u32, bool>::new(&env);
-        for outcome in winning_outcomes.iter() {
-            if outcome >= outcome_count {
-                return Err(ContractError::InvalidOutcome);
-            }
-            if seen.contains_key(outcome) {
-                return Err(ContractError::InvalidWinningOutcomes);
-            }
-            seen.set(outcome, true);
-        }
-
-        env.invoke_contract::<()>(
-            &markets_contract,
-            &Symbol::new(&env, "resolve_market_with_outcomes"),
-            soroban_sdk::vec![
-                &env,
-                resolver.clone().into_val(&env),
-                market_id.into(),
-                winning_outcomes.clone().into(),
-            ],
-        );
-
-        let status = ResolutionStatus {
-            market_id,
-            winning_outcomes,
-            resolved_at: env.ledger().timestamp(),
-            oracle: oracle_contract,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::ResolutionStatus(market_id), &status);
-        Self::extend_ttl(
-            &env,
-            &DataKey::ResolutionStatus(market_id),
-            RESOLUTION_TTL_LEDGERS,
-        );
-
-        let cooldown_key = DataKey::LastResolution(resolver);
-        env.storage()
-            .persistent()
-            .set(&cooldown_key, &status.resolved_at);
-        Self::extend_ttl(&env, &cooldown_key, COOLDOWN_TTL_LEDGERS);
-
-        Ok(status)
-    }
-
-    /// Resolve a market by retrieving its result from a specific oracle address.
-    ///
-    /// Unlike [`resolve_market`], which uses the single pre-configured oracle contract
-    /// opaquely, this entry-point lets the resolver name the oracle address explicitly.
-    /// Before fetching any result the oracle address is validated against the registry
-    /// maintained by the stored `OracleContract` by calling its `list_oracles` entrypoint.
-    /// If the address is not found in that list the call is rejected with
-    /// [`ContractError::OracleNotRegistered`], preventing a malicious caller from
-    /// pointing the resolution at an oracle contract they control.
-    pub fn resolve_market_with_oracles(
-        env: Env,
-        resolver: Address,
-        market_id: u32,
-        oracle: Address,
-    ) -> Result<ResolutionStatus, ContractError> {
-        resolver.require_auth();
-        if env.storage().persistent().has(&DataKey::Admin) {
-            Self::extend_ttl(&env, &DataKey::Admin, COOLDOWN_TTL_LEDGERS);
-        }
-
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::ResolutionStatus(market_id))
-        {
-            return Err(ContractError::MarketAlreadyResolved);
-        }
-
-        let markets_contract: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MarketsContract)
-            .ok_or(ContractError::InvalidState)?;
-        Self::extend_ttl(&env, &DataKey::MarketsContract, COOLDOWN_TTL_LEDGERS);
-
-        let oracle_contract: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OracleContract)
-            .ok_or(ContractError::InvalidState)?;
-        Self::extend_ttl(&env, &DataKey::OracleContract, COOLDOWN_TTL_LEDGERS);
-
-        // Validate that the caller-supplied oracle address appears in the registry
-        // maintained by the oracles contract. This prevents a caller from supplying
-        // an arbitrary address that impersonates a legitimate oracle.
-        let registered_oracles: Vec<Address> = match env
-            .try_invoke_contract::<Vec<Address>, soroban_sdk::Error>(
-                &oracle_contract,
-                &Symbol::new(&env, "list_oracles"),
-                soroban_sdk::vec![&env],
-            ) {
-            Ok(Ok(list)) => list,
-            _ => return Err(ContractError::InvalidState),
-        };
-        if !registered_oracles.contains(&oracle) {
-            return Err(ContractError::OracleNotRegistered);
-        }
-
-        let market = match env
-            .try_invoke_contract::<Option<(Address, u64, u32, bool, bool)>, soroban_sdk::Error>(
-                &markets_contract,
-                &Symbol::new(&env, "get_market_for_resolution"),
-                soroban_sdk::vec![&env, market_id.into()],
-            ) {
-            Ok(Ok(Some(market))) => market,
-            Ok(Ok(None)) => return Err(ContractError::MarketNotFound),
-            _ => return Err(ContractError::InvalidState),
-        };
-        let (market_creator, market_end_time, outcome_count, resolved, cancelled) = market;
-        if resolver != market_creator {
-            return Err(ContractError::Unauthorized);
-        }
-        if resolved {
-            return Err(ContractError::MarketAlreadyResolved);
-        }
-        if cancelled {
-            return Err(ContractError::InvalidState);
-        }
-        if env.ledger().timestamp() < market_end_time {
-            return Err(ContractError::MarketClosed);
-        }
-        Self::check_cooldown(&env, &resolver)?;
-
-        // Fetch the result from the validated oracle address, not the registry contract.
-        let winning_outcomes = match env
-            .try_invoke_contract::<Option<Vec<u32>>, soroban_sdk::Error>(
-                &oracle,
-                &Symbol::new(&env, "get_result"),
-                soroban_sdk::vec![&env, market_id.into()],
-            ) {
-            Ok(Ok(Some(result))) => result,
-            _ => return Err(ContractError::OracleResultNotAvailable),
-        };
-        if winning_outcomes.is_empty() {
-            return Err(ContractError::InvalidWinningOutcomes);
-        }
-        if winning_outcomes.len() > outcome_count {
-            return Err(ContractError::InvalidWinningOutcomes);
-        }
-        let mut seen = Map::<u32, bool>::new(&env);
-        for outcome in winning_outcomes.iter() {
-            if outcome >= outcome_count {
-                return Err(ContractError::InvalidOutcome);
-            }
-            if seen.contains_key(outcome) {
-                return Err(ContractError::InvalidWinningOutcomes);
-            }
-            seen.set(outcome, true);
-        }
-
-        env.invoke_contract::<()>(
-            &markets_contract,
-            &Symbol::new(&env, "resolve_market_with_outcomes"),
-            soroban_sdk::vec![
-                &env,
-                resolver.clone().into_val(&env),
-                market_id.into(),
-                winning_outcomes.clone().into(),
-            ],
-        );
-
-        let status = ResolutionStatus {
-            market_id,
-            winning_outcomes,
-            resolved_at: env.ledger().timestamp(),
-            oracle: oracle.clone(),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::ResolutionStatus(market_id), &status);
-        Self::extend_ttl(
-            &env,
-            &DataKey::ResolutionStatus(market_id),
-            RESOLUTION_TTL_LEDGERS,
-        );
-
-        let cooldown_key = DataKey::LastResolution(resolver);
-        env.storage()
-            .persistent()
-            .set(&cooldown_key, &status.resolved_at);
-        Self::extend_ttl(&env, &cooldown_key, COOLDOWN_TTL_LEDGERS);
-
-        Ok(status)
-    }
-
-    /// Return the recorded resolution details, if the market has been resolved.
-    pub fn get_resolution_status(env: Env, market_id: u32) -> Option<ResolutionStatus> {
-        let key = DataKey::ResolutionStatus(market_id);
-        let status: Option<ResolutionStatus> = env.storage().persistent().get(&key);
-        if status.is_some() {
-            Self::extend_ttl(&env, &key, RESOLUTION_TTL_LEDGERS);
-        }
-        status
     }
 }
