@@ -17,3 +17,7 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 [[test]]
 name = "error_tests"
 path = "tests/error_tests.rs"
+
+[[test]]
+name = "init_validation_tests"
+path = "tests/init_validation_tests.rs"
