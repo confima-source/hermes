@@ -111,7 +111,8 @@ impl MigrateContract {
     ///
     /// This entrypoint delegates to [`migrate::migrate_error_state`] and
     /// provides the same pre-condition guarantees — version compare-and-set,
-    /// admin authentication, and an extensible data-reshape hook.
+    /// admin authentication, and an extensible data-reshape hook. The stored
+    /// version advances only after every migration step succeeds.
     ///
     /// # Errors
     ///
